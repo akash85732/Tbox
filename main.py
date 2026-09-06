@@ -1,5 +1,8 @@
 import logging
 import re
+import random
+import time
+import threading
 import asyncio
 import os
 import tempfile
@@ -128,20 +131,27 @@ def fresh_session_and_csrf() -> tuple[requests.Session, str] | None:
     return session, csrf
 
 
-# ─── API CALL ─────────────────────────────────────────────────────────────────
-def fetch_video_info(url: str) -> dict | None:
-    """
-    Fresh CSRF + session per call. Retries once on 419.
-    Returns first video dict from response array.
-    """
-    for attempt in range(2):
-        ctx = fresh_session_and_csrf()
-        if not ctx:
-            logger.error("Could not get session/CSRF")
-            continue
+# ─── CSRF TOKEN REFRESH MANAGER ──────────────────────────────────────────────
+# CSRF tokens are one-shot/short-lived on flowvideoplayer.com: they expire,
+# get invalidated after use, or mismatch (HTTP 419) when the session cookies
+# drift. This manager owns a cached token and transparently REFRESHES it on
+# expiry / 419 / 401 / 403, so every API call always sends a valid token.
+TOKEN_TTL_SECONDS = 300            # refresh a token if older than 5 min
+CSRF_MAX_REFRESH_ATTEMPTS = 4      # how many fresh tokens to try per call
+CSRF_BACKOFF_BASE = 0.7            # seconds between refresh attempts
 
-        session, csrf = ctx
 
+class CsrfManager:
+    """Thread-safe CSRF token cache with automatic refresh on invalidation."""
+
+    def __init__(self, ttl_seconds: int = TOKEN_TTL_SECONDS):
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
+        self._session: requests.Session | None = None
+        self._csrf: str | None = None
+        self._created: float = 0.0
+
+    def _api_headers(self, csrf: str, api_headers: dict | None = None) -> dict:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -154,29 +164,147 @@ def fetch_video_info(url: str) -> dict | None:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Dest": "empty",
         }
+        if api_headers:
+            headers.update(api_headers)
+        return headers
 
-        try:
-            resp = session.post(
-                API_URL,
-                json={"url": url},
-                headers=headers,
-                timeout=30
-            )
+    def _fetch_fresh(self) -> bool:
+        """Force-build a brand new session+token (outside lock contention)."""
+        ctx = fresh_session_and_csrf()
+        if not ctx:
+            return False
+        self._session, self._csrf = ctx
+        self._created = time.time()
+        return True
 
-            if resp.status_code == 419:
-                logger.warning("419 CSRF mismatch — retrying with fresh token...")
+    def get_context(self, api_headers: dict | None = None):
+        """
+        Return (session, csrf, headers) for an API call, building or
+        refreshing the token if it's missing or has expired.
+        """
+        with self._lock:
+            now = time.time()
+            # Building a fresh context takes ~1-2s; only refresh when needed.
+            if self._csrf and self._session and (now - self._created) < self._ttl:
+                return self._session, self._csrf, self._api_headers(self._csrf, api_headers)
+            # Cache miss or expired -> refresh.
+            refreshed = self._fetch_fresh()
+            if not refreshed:
+                # Last resort: if we can't refresh, try whatever old token we have.
+                if self._csrf and self._session:
+                    return self._session, self._csrf, self._api_headers(self._csrf, api_headers)
+            if not self._csrf or not self._session:
+                raise RuntimeError("Could not obtain a CSRF token")
+            return self._session, self._csrf, self._api_headers(self._csrf, api_headers)
+
+    def invalidate(self):
+        """Drop the cached token so the next call fetches a fresh one."""
+        with self._lock:
+            self._session = None
+            self._csrf = None
+            self._created = 0.0
+
+    def post_json(self, url: str, payload: dict, api_headers: dict | None = None) -> requests.Response:
+        """
+        POST JSON to `url` using the managed token, automatically refreshing
+        the CSRF token and retrying when the server invalidates it
+        (HTTP 419 / 401 / 403). Returns the first non-CSRF-error response.
+        """
+        last_resp: requests.Response | None = None
+        for attempt in range(CSRF_MAX_REFRESH_ATTEMPTS):
+            cur_time = time.time()
+            with self._lock:
+                # Refresh if TTL expired or no cached token yet.
+                if not self._session or not self._csrf or (cur_time - self._created) >= self._ttl:
+                    self._fetch_fresh()
+                if not self._session or not self._csrf:
+                    raise RuntimeError("Could not obtain a CSRF token")
+                session = self._session
+                csrf = self._csrf
+                created = self._created
+
+            headers = self._api_headers(csrf, api_headers)
+            try:
+                resp = session.post(url, json=payload, headers=headers, timeout=30)
+            except Exception as e:
+                logger.error(f"CSRF POST error (attempt {attempt+1}): {e}")
+                # Network error -> force token refresh and retry.
+                self.invalidate()
+                if attempt == CSRF_MAX_REFRESH_ATTEMPTS - 1:
+                    raise
+                time.sleep(CSRF_BACKOFF_BASE * (attempt + 1) + random.uniform(0, 0.3))
                 continue
 
-            data = resp.json()
+            last_resp = resp
 
-            if data.get("code") == 200 and data.get("status") and data.get("response"):
-                return data["response"][0], session, csrf
+            # Token invalid / expired -> refresh and retry.
+            if resp.status_code in (419, 401, 403):
+                logger.warning(
+                    f"CSRF invalid (HTTP {resp.status_code}) — refreshing token "
+                    f"(attempt {attempt+1}/{CSRF_MAX_REFRESH_ATTEMPTS})"
+                )
+                self.invalidate()
+                if attempt == CSRF_MAX_REFRESH_ATTEMPTS - 1:
+                    break
+                time.sleep(CSRF_BACKOFF_BASE * (attempt + 1) + random.uniform(0, 0.3))
+                continue
 
-            logger.warning(f"API: {data.get('message')} | HTTP {resp.status_code}")
+            # flowvideoplayer returns HTTP 200/201 with {"code":201,"message":
+            # "Direct access blocked"} when the device/init fingerprint token was
+            # rejected. Treat that as another token/device invalidation.
+            if resp.status_code == 200 and resp.content:
+                try:
+                    _d = resp.json()
+                except Exception:
+                    _d = None
+                if _d is not None and _d.get("code") == 201 and "blocked" in str(_d.get("message", "")).lower():
+                    logger.warning(
+                        f"Direct access blocked — refreshing device/CSRF token "
+                        f"(attempt {attempt+1}/{CSRF_MAX_REFRESH_ATTEMPTS})"
+                    )
+                    self.invalidate()
+                    if attempt == CSRF_MAX_REFRESH_ATTEMPTS - 1:
+                        break
+                    time.sleep(CSRF_BACKOFF_BASE * (attempt + 1) + random.uniform(0, 0.3))
+                    continue
 
-        except Exception as e:
-            logger.error(f"API error (attempt {attempt+1}): {e}")
+            # Any other status (including 200) -> hand back to caller.
+            return resp, None
 
+        return last_resp, ("CSRF refresh failed after multiple attempts" if last_resp is None
+                           else f"CSRF still failing after {CSRF_MAX_REFRESH_ATTEMPTS} attempts")
+
+
+# Instance used by fetch_video_info.
+_csrf = CsrfManager()
+
+
+# ─── API CALL ─────────────────────────────────────────────────────────────────
+def fetch_video_info(url: str) -> dict | None:
+    """
+    Resolve a TeraBox link via the managed CSRF session.
+    The CSRF token is cached + auto-refreshed on expiry / HTTP 419 / 401 / 403.
+
+    Returns (info, session, csrf) so the caller can stream the download with
+    the SAME session whose cookies last saw a valid token.
+    """
+    resp, err = _csrf.post_json(API_URL, {"url": url})
+
+    if resp is None or resp.status_code != 200:
+        logger.error(f"API request failed: {err or f'HTTP {getattr(resp, "status_code", "?")}'}")
+        return None
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.error(f"API JSON parse: {e}")
+        return None
+
+    if data.get("code") == 200 and data.get("status") and data.get("response"):
+        session, csrf, _headers = _csrf.get_context()
+        return data["response"][0], session, csrf
+
+    logger.warning(f"API: {data.get('message')} | HTTP {resp.status_code}")
     return None
 
 
